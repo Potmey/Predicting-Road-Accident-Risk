@@ -3,308 +3,216 @@ export class DataLoader {
   constructor(logFn, statusFn) {
     this.log = logFn || console.log;
     this.setStatus = statusFn || (()=>{});
-    this.raw = null;           // parsed rows (objects)
-    this.schema = null;        // { features: {...}, target: 'accident_risk' }
-    this.encoders = {};        // one-hot maps for categoricals
-    this.scalers = {};         // {numericKey: {type, min, max, mean, std}}
+    this.raw = null;           // [{col:val,...}]
+    this.schema = null;        // { features: {name,type,values?,stats?}, target:'accident_risk' }
+    this.encoders = {};        // {catKey: [values...]}
+    this.scaler = { type:'minmax', stats:{} }; // by feature index
     this.X = null; this.y = null;
-    this.split = { idxTrain: [], idxVal: [], idxTest: [] };
+    this.idx = { train: [], test: [] };
+    this.featNames = [];
   }
 
-  async loadCSV(path, useSubset=false, subsetSize=50000) {
-    this.setStatus('loading data…');
-    this.log(`Loading CSV: ${path}`);
+  async loadCSV(path='./data/train.csv') {
+    this.setStatus('loading data…'); this.log(`Fetching ${path}`);
     const res = await fetch(path);
     if (!res.ok) throw new Error(`Failed to fetch ${path}: ${res.status}`);
     const text = await res.text();
     this.raw = this.#parseCSV(text);
-    if (useSubset && this.raw.length > subsetSize) {
-      this.log(`Sampling subset: ${subsetSize}/${this.raw.length}`);
-      this.raw = this.#sampleArray(this.raw, subsetSize, 2024);
-    }
-    this.log(`CSV loaded: rows=${this.raw.length}`);
+    if (!this.raw.length) throw new Error('CSV is empty.');
     this.#inferSchema();
-    this.setStatus('data loaded');
+    this.setStatus('data loaded'); this.log(`Loaded rows=${this.raw.length}`);
   }
 
-  // Basic CSV parser (expects header row, comma separated, no quotes with commas inside for simplicity)
   #parseCSV(text) {
-    const [headerLine, ...lines] = text.trim().split(/\r?\n/);
-    const headers = headerLine.split(',').map(h => h.trim());
-    return lines.map(line => {
+    const [h, ...lines] = text.trim().split(/\r?\n/);
+    const headers = h.split(',').map(s=>s.trim());
+    return lines.map(line=>{
       const cells = line.split(',').map(v => v.trim());
-      const obj = {};
-      headers.forEach((h,i) => obj[h] = cells[i] === undefined ? '' : cells[i]);
-      return obj;
+      const o = {}; headers.forEach((k,i)=>o[k]=cells[i]??'');
+      return o;
     });
   }
 
-  #toNumberMaybe(v) {
-    if (v === '' || v === null || v === undefined) return NaN;
-    const n = Number(v);
-    return Number.isFinite(n) ? n : NaN;
-  }
+  #num(v){ const n=Number(v); return Number.isFinite(n)?n:NaN; }
 
   #inferSchema() {
-    // Target is fixed
     const target = 'accident_risk';
-    if (!this.raw.length || !(target in this.raw[0])) {
-      throw new Error(`Target "${target}" not found in CSV.`);
-    }
-
-    const knownCategoricals = new Set([
-      'road_type','lighting','weather','time_of_day',
-      'road_signs_present','public_road','holiday','school_season'
-    ]);
-    const knownNumeric = new Set([
-      'num_lanes','curvature','speed_limit','num_reported_accidents'
-    ]);
-
-    const cols = Object.keys(this.raw[0]).filter(k => k !== target);
+    if (!(target in this.raw[0])) throw new Error(`Target "${target}" not found`);
+    const knownCat = new Set(['road_type','lighting','weather','time_of_day','road_signs_present','public_road','holiday','school_season']);
+    const knownNum = new Set(['num_lanes','curvature','speed_limit','num_reported_accidents']);
     const features = {};
-    for (const col of cols) {
-      // Try infer by known lists; otherwise infer by value patterns
-      let type = 'numeric';
-      if (knownCategoricals.has(col)) type = 'categorical';
-      if (knownNumeric.has(col)) type = 'numeric';
-
-      if (!knownCategoricals.has(col) && !knownNumeric.has(col)) {
-        // quick sniff: if many unique small set → categorical
-        const sampleVals = this.raw.slice(0, Math.min(5000, this.raw.length)).map(r => r[col]);
-        const numericRatio = sampleVals.filter(v => Number.isFinite(Number(v))).length / sampleVals.length;
-        const uniq = new Set(sampleVals.map(v => String(v)));
-        if (numericRatio > 0.9) type = 'numeric';
-        if (uniq.size <= 10) type = 'categorical';
+    const cols = Object.keys(this.raw[0]).filter(c=>c!==target);
+    for (const c of cols){
+      let type='numeric';
+      if (knownCat.has(c)) type='categorical';
+      if (knownNum.has(c)) type='numeric';
+      if (!knownCat.has(c) && !knownNum.has(c)) {
+        const sample = this.raw.slice(0,Math.min(5000,this.raw.length)).map(r=>r[c]);
+        const uniq = new Set(sample.map(String));
+        const numRatio = sample.filter(v=>Number.isFinite(Number(v))).length / Math.max(1,sample.length);
+        if (uniq.size<=10) type='categorical';
+        else if (numRatio>0.9) type='numeric';
       }
-
-      features[col] = { name: col, type };
+      features[c]={name:c,type};
     }
-
-    // Compute stats for numeric; collect uniques for categoricals/booleans
-    for (const [k, f] of Object.entries(features)) {
-      if (f.type === 'numeric') {
-        const arr = this.raw.map(r => this.#toNumberMaybe(r[k])).filter(Number.isFinite);
-        const min = Math.min(...arr), max = Math.max(...arr);
-        const mean = arr.reduce((a,b)=>a+b,0)/arr.length || 0;
+    // stats / values
+    for (const [k,f] of Object.entries(features)){
+      if (f.type==='numeric'){
+        const arr = this.raw.map(r=>this.#num(r[k])).filter(Number.isFinite);
+        const min = Math.min(...arr), max=Math.max(...arr);
+        const mean = arr.reduce((a,b)=>a+b,0)/arr.length;
         const std = Math.sqrt(arr.reduce((s,v)=>s+(v-mean)*(v-mean),0)/Math.max(1,(arr.length-1)));
-        f.stats = { min, max, mean, std, count: arr.length };
+        f.stats={min,max,mean,std};
       } else {
-        const uniq = new Set(this.raw.map(r => String(r[k])));
-        f.values = [...uniq].filter(v => v !== '' && v !== 'undefined');
-        // normalize booleans if applicable
-        const lower = f.values.map(v => v.toLowerCase());
-        if (lower.every(v => v === 'true' || v === 'false')) {
-          f.type = 'boolean';
-          f.values = ['True','False'];
-        }
+        let vals = [...new Set(this.raw.map(r=>String(r[k])).filter(v=>v!=='').map(String))];
+        const lower = vals.map(v=>v.toLowerCase());
+        if (lower.every(v=>v==='true'||v==='false')) { f.type='boolean'; vals=['True','False']; }
+        f.values=vals.slice(0,50);
       }
     }
-
     this.schema = { features, target };
-    this.log(`Schema inferred. Features: ${Object.keys(features).length}, target: ${target}`);
   }
 
-  buildFilterControls(containerEl) {
-    containerEl.innerHTML = '';
-    const make = (html) => {
-      const div = document.createElement('div'); div.innerHTML = html; return div.firstElementChild;
-    };
-    for (const [k, f] of Object.entries(this.schema.features)) {
-      if (f.type === 'numeric') {
-        const min = Number.isFinite(f.stats?.min) ? f.stats.min : 0;
-        const max = Number.isFinite(f.stats?.max) ? f.stats.max : 1;
-        const block = make(`
-          <div>
-            <label>${k} (range)</label>
-            <input type="number" id="min_${k}" placeholder="min" value="${min}">
-            <input type="number" id="max_${k}" placeholder="max" value="${max}">
-          </div>`);
-        containerEl.appendChild(block);
-      } else if (f.type === 'boolean') {
-        const block = make(`
-          <div>
-            <label>${k}</label>
-            <select id="sel_${k}">
-              <option value="any" selected>Any</option>
-              <option value="True">True</option>
-              <option value="False">False</option>
-            </select>
-          </div>`);
-        containerEl.appendChild(block);
-      } else if (f.type === 'categorical') {
-        const opts = (f.values||[]).map(v => `<option value="${v}">${v}</option>`).join('');
-        const block = make(`
-          <div>
-            <label>${k} (multi)</label>
-            <select id="sel_${k}" multiple size="${Math.min(6,(f.values||[]).length||3)}">${opts}</select>
-          </div>`);
-        containerEl.appendChild(block);
+  prepareMatrices() {
+    // build encoders + featNames
+    this.encoders={}; this.featNames=[];
+    for (const [k,f] of Object.entries(this.schema.features)){
+      if (f.type==='numeric' || f.type==='boolean'){ this.featNames.push(k); }
+      else if (f.type==='categorical'){
+        this.encoders[k] = f.values||[];
+        for (const v of this.encoders[k]) this.featNames.push(`${k}__${v}`);
       }
     }
-  }
-
-  // Return array of row indices that pass UI filters
-  indicesByFilters(readFilterFn) {
-    const filters = readFilterFn(this.schema);
-    const idx = [];
-    for (let i=0;i<this.raw.length;i++){
-      const r = this.raw[i];
-      let ok = true;
-      for (const [k,f] of Object.entries(this.schema.features)) {
-        const v = r[k];
-        const flt = filters[k];
-        if (!flt) continue;
-        if (f.type === 'numeric') {
-          const n = this.#toNumberMaybe(v);
-          if (!Number.isFinite(n)) { ok=false; break; }
-          if (n < flt.min || n > flt.max) { ok=false; break; }
-        } else if (f.type === 'boolean') {
-          if (flt.mode !== 'any' && String(v) !== flt.mode) { ok=false; break; }
-        } else if (f.type === 'categorical') {
-          if (flt.set && flt.set.size>0 && !flt.set.has(String(v))) { ok=false; break; }
+    const X=[]; const y=[];
+    for (const r of this.raw){
+      const row=[];
+      for (const [k,f] of Object.entries(this.schema.features)){
+        if (f.type==='numeric'){ row.push(this.#num(r[k])); }
+        else if (f.type==='boolean'){ row.push(String(r[k])==='True'?1:0); }
+        else { // categorical → one-hot
+          const cats=this.encoders[k]||[];
+          for (const v of cats) row.push(String(r[k])===v?1:0);
         }
       }
-      if (ok) idx.push(i);
+      X.push(row); y.push([Number(r[this.schema.target])]);
     }
-    return idx;
-  }
-
-  // Prepare encoded & scaled matrices and split into train/val/test
-  prepareMatrices(scalerType='minmax', seed=2025) {
-    // Build encoders for categoricals/booleans
-    this.encoders = {};
-    const featNames = [];
-    for (const [k,f] of Object.entries(this.schema.features)) {
-      if (f.type === 'numeric') {
-        featNames.push(k);
-      } else if (f.type === 'boolean') {
-        featNames.push(k); // map True→1, False→0
-      } else if (f.type === 'categorical') {
-        this.encoders[k] = (f.values||[]).map(v => String(v));
-        for (const _ of this.encoders[k]) featNames.push(`${k}__${_}`);
-      }
+    // fit MinMax scaler on numeric/boolean positions
+    this.scaler={type:'minmax', stats:{}};
+    const numericIdx=[];
+    let col=0;
+    for (const [k,f] of Object.entries(this.schema.features)){
+      if (f.type==='numeric' || f.type==='boolean'){ numericIdx.push(col); col+=1; }
+      else { col += (this.encoders[k]||[]).length; }
     }
-
-    // Build X/y
-    const X = []; const y = [];
-    for (const r of this.raw) {
-      const row = [];
-      for (const [k,f] of Object.entries(this.schema.features)) {
-        if (f.type === 'numeric') {
-          row.push(this.#toNumberMaybe(r[k]));
-        } else if (f.type === 'boolean') {
-          row.push(String(r[k]) === 'True' ? 1 : 0);
-        } else if (f.type === 'categorical') {
-          const cats = this.encoders[k] || [];
-          const one = cats.map(v => (String(r[k])===v ? 1 : 0));
-          row.push(...one);
-        }
-      }
-      X.push(row);
-      y.push([Number(r[this.schema.target])]);
-    }
-
-    // Fit scalers on numeric columns only (in their feature positions)
-    this.scalers = { type: scalerType, stats: {} };
-    const Xmat = X;
-    const nRows = Xmat.length, nCols = (Xmat[0]||[]).length;
-    // Determine which columns are numeric original
-    const numericColIdx = [];
-    let colPointer = 0;
-    for (const [k,f] of Object.entries(this.schema.features)) {
-      if (f.type === 'numeric' || f.type === 'boolean') {
-        numericColIdx.push(colPointer);
-        colPointer += 1;
-      } else if (f.type === 'categorical') {
-        colPointer += (this.encoders[k]||[]).length;
-      }
-    }
-
-    // collect stats
-    for (const c of numericColIdx) {
-      const col = Xmat.map(r => r[c]).filter(Number.isFinite);
-      const min = Math.min(...col), max = Math.max(...col);
-      const mean = col.reduce((a,b)=>a+b,0)/Math.max(1,col.length);
-      const std = Math.sqrt(col.reduce((s,v)=>s+(v-mean)*(v-mean),0)/Math.max(1,(col.length-1)));
-      this.scalers.stats[c] = { min, max, mean, std };
+    for (const c of numericIdx){
+      const colVals = X.map(r=>r[c]).filter(Number.isFinite);
+      const min=Math.min(...colVals), max=Math.max(...colVals);
+      const mean = colVals.reduce((a,b)=>a+b,0)/Math.max(1,colVals.length);
+      const std = Math.sqrt(colVals.reduce((s,v)=>s+(v-mean)*(v-mean),0)/Math.max(1,(colVals.length-1)));
+      this.scaler.stats[c]={min,max,mean,std};
     }
     // apply scaling
-    for (let i=0;i<nRows;i++){
-      for (const c of numericColIdx) {
-        const v = Xmat[i][c];
-        const st = this.scalers.stats[c];
-        if (!Number.isFinite(v)) { Xmat[i][c] = 0; continue; }
-        if (scalerType === 'minmax') {
-          const d = (st.max - st.min) || 1;
-          Xmat[i][c] = (v - st.min) / d;
-        } else {
-          const d = st.std || 1;
-          Xmat[i][c] = (v - st.mean) / d;
-        }
+    for (let i=0;i<X.length;i++){
+      for (const c of numericIdx){
+        const st=this.scaler.stats[c]; const v=X[i][c];
+        if (!Number.isFinite(v)) { X[i][c]=0; continue; }
+        const d=(st.max-st.min)||1; X[i][c]=(v-st.min)/d;
       }
     }
-
-    this.X = Xmat; this.y = y;
-    // random split (no time in CSV)
-    const idx = [...Array(nRows).keys()];
-    this.#shuffle(idx, seed);
-    const nTrain = Math.floor(nRows*0.7);
-    const nVal = Math.floor(nRows*0.15);
-    this.split.idxTrain = idx.slice(0, nTrain);
-    this.split.idxVal = idx.slice(nTrain, nTrain+nVal);
-    this.split.idxTest = idx.slice(nTrain+nVal);
-    this.log(`Prepared matrices: X=[${nRows}×${nCols}], y=[${nRows}×1]. Split: train=${this.split.idxTrain.length}, val=${this.split.idxVal.length}, test=${this.split.idxTest.length}`);
-    return { featNames };
+    this.X=X; this.y=y;
+    // split 80/20 with seed
+    const idx=[...Array(X.length).keys()]; this.#shuffle(idx,2025);
+    const nTr=Math.floor(idx.length*0.8); this.idx.train=idx.slice(0,nTr); this.idx.test=idx.slice(nTr);
+    return { featNames: this.featNames };
   }
 
-  getTensors(part='train') {
-    const idxs = part==='train' ? this.split.idxTrain : part==='val' ? this.split.idxVal : this.split.idxTest;
-    const X = idxs.map(i => this.X[i]);
-    const y = idxs.map(i => this.y[i]);
-    return { X, y };
+  getTrain(){ return this.idx.train.map(i=>this.X[i]); }
+  getTrainY(){ return this.idx.train.map(i=>this.y[i]); }
+  getTest(){ return this.idx.test.map(i=>this.X[i]); }
+  getTestY(){ return this.idx.test.map(i=>this.y[i]); }
+
+  // === Simulation UI ===
+  buildSimulationForm(container) {
+    container.innerHTML='';
+    const add = (html)=>{ const d=document.createElement('div'); d.innerHTML=html.trim(); return container.appendChild(d.firstElementChild); };
+    // categorical helpers
+    const cat = (id, label, values)=> add(`
+      <div><label>${label}</label>
+        <select id="${id}">
+          ${values.map(v=>`<option value="${v}">${v}</option>`).join('')}
+        </select>
+      </div>`);
+    const bool = (id,label)=> add(`
+      <div><label>${label}</label>
+        <select id="${id}">
+          <option value="True">True</option>
+          <option value="False">False</option>
+        </select>
+      </div>`);
+    const num = (id,label,step='1',val='0')=> add(`
+      <div><label>${label}</label>
+        <input id="${id}" type="number" step="${step}" value="${val}" />
+      </div>`);
+
+    // fixed 14 fields (take values/stats from schema when available)
+    const F=this.schema.features;
+    cat('sim_road_type','road_type', F.road_type?.values||['urban','rural','highway']);
+    num('sim_num_lanes','num_lanes','1', String(F.num_lanes?.stats?.mean??2|0));
+    num('sim_curvature','curvature','0.01', String(F.curvature?.stats?.mean??0.5));
+    num('sim_speed_limit','speed_limit','1', String(F.speed_limit?.stats?.mean??60));
+    cat('sim_lighting','lighting', F.lighting?.values||['daylight','night','dim']);
+    cat('sim_weather','weather', F.weather?.values||['clear','rainy','foggy']);
+    bool('sim_road_signs_present','road_signs_present');
+    bool('sim_public_road','public_road');
+    cat('sim_time_of_day','time_of_day', F.time_of_day?.values||['morning','afternoon','evening']);
+    bool('sim_holiday','holiday');
+    bool('sim_school_season','school_season');
+    num('sim_num_reported_accidents','num_reported_accidents','1', String(F.num_reported_accidents?.stats?.mean??0|0));
   }
 
-  // Slice test by filters (for Evaluate (Filtered))
-  getFilteredTest(readFilterFn) {
-    const idxAll = this.split.idxTest;
-    const filters = readFilterFn(this.schema);
-    const pass = [];
-    for (const i of idxAll) {
-      const r = this.raw[i];
-      let ok = true;
-      for (const [k,f] of Object.entries(this.schema.features)) {
-        const v = r[k];
-        const flt = filters[k];
-        if (!flt) continue;
-        if (f.type === 'numeric') {
-          const n = this.#toNumberMaybe(v);
-          if (!Number.isFinite(n) || n < flt.min || n > flt.max) { ok=false; break; }
-        } else if (f.type === 'boolean') {
-          if (flt.mode !== 'any' && String(v) !== flt.mode) { ok=false; break; }
-        } else if (f.type === 'categorical') {
-          if (flt.set && flt.set.size>0 && !flt.set.has(String(v))) { ok=false; break; }
-        }
+  // read form and encode → scaled vector ready for model
+  encodeSimulationInput() {
+    const o = (id)=>document.getElementById(id).value;
+    const sample = {
+      road_type: o('sim_road_type'),
+      num_lanes: Number(o('sim_num_lanes')),
+      curvature: Number(o('sim_curvature')),
+      speed_limit: Number(o('sim_speed_limit')),
+      lighting: o('sim_lighting'),
+      weather: o('sim_weather'),
+      road_signs_present: o('sim_road_signs_present'),
+      public_road: o('sim_public_road'),
+      time_of_day: o('sim_time_of_day'),
+      holiday: o('sim_holiday'),
+      school_season: o('sim_school_season'),
+      num_reported_accidents: Number(o('sim_num_reported_accidents'))
+    };
+    // encode like training
+    const row=[];
+    let col=0;
+    for (const [k,f] of Object.entries(this.schema.features)){
+      if (f.type==='numeric'){
+        let v = Number(sample[k]); // may be NaN
+        if (!Number.isFinite(v)) v = this.schema.features[k]?.stats?.mean ?? 0;
+        const st = this.scaler.stats[col];
+        const d=(st.max-st.min)||1; row.push((v - st.min)/d);
+        col+=1;
+      } else if (f.type==='boolean'){
+        const v = String(sample[k])==='True'?1:0;
+        const st = this.scaler.stats[col];
+        const d=(st.max-st.min)||1; row.push((v - st.min)/d);
+        col+=1;
+      } else { // categorical
+        const cats = this.encoders[k]||[];
+        for (const v of cats) row.push(String(sample[k])===v?1:0);
+        col += cats.length;
       }
-      if (ok) pass.push(i);
     }
-    const X = pass.map(i => this.X[i]);
-    const y = pass.map(i => this.y[i]);
-    return { X, y, n: pass.length };
+    return row;
   }
 
-  // utils
-  #shuffle(a, seed=123) {
-    let s = seed;
-    const rnd = () => (s = (s*16807)%2147483647) / 2147483647;
-    for (let i=a.length-1;i>0;i--){
-      const j = Math.floor(rnd()*(i+1));
-      [a[i],a[j]]=[a[j],a[i]];
-    }
-  }
-  #sampleArray(arr, n, seed=123) {
-    const idx = [...Array(arr.length).keys()];
-    this.#shuffle(idx, seed);
-    const chosen = idx.slice(0, Math.min(n, arr.length));
-    return chosen.map(i => arr[i]);
+  #shuffle(a, seed=123){
+    let s=seed; const rnd=()=> (s=(s*16807)%2147483647)/2147483647;
+    for (let i=a.length-1;i>0;i--){ const j=Math.floor(rnd()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; }
   }
 }
