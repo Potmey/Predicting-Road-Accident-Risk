@@ -1,0 +1,154 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Road Accident Risk — TF.js (Playground S5E10)</title>
+  <style>
+    :root { --gap: 10px; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial; margin: 20px; line-height: 1.45; }
+    h1 { font-size: 22px; margin: 0 0 8px; }
+    .row { display: flex; gap: var(--gap); flex-wrap: wrap; align-items: stretch; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.05); background: #fff; }
+    .controls .card { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--gap); }
+    label { font-size: 12px; color: #333; display: block; margin-bottom: 4px; }
+    input[type="number"], input[type="text"], select, input[type="range"] { width: 100%; }
+    input[type="range"] { accent-color: #1e88e5; }
+    .value { font-variant-numeric: tabular-nums; font-size: 12px; color:#333; }
+    button { cursor: pointer; border: 1px solid #ccc; border-radius: 10px; padding: 8px 12px; background: #fafafa; }
+    button.primary { background: #1e88e5; color: white; border-color: #1976d2; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .grid { display: grid; gap: var(--gap); }
+    .badges { display: inline-flex; gap:6px; align-items:center; }
+    .badge { background:#eef; color:#225; padding:2px 8px; border-radius: 999px; font-size: 12px; border:1px solid #dde; }
+    #log { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #0b1020; color: #d3e2ff; padding: 10px; border-radius: 10px; max-height: 260px; overflow: auto; }
+    table { border-collapse: collapse; font-size: 14px; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+    .two-col { display:grid; grid-template-columns: 2fr 1fr; gap: var(--gap); }
+    @media (max-width: 900px){ .two-col { grid-template-columns: 1fr; } }
+    .muted { color:#666; font-size:12px; }
+    .pill { font-size: 12px; padding: 2px 8px; background:#f5f5f7; border:1px solid #ddd; border-radius:999px; display:inline-block; }
+    .controls-title { font-weight:600; margin-bottom:6px; }
+  </style>
+</head>
+<body>
+  <h1>Road Accident Risk — TF.js (Playground S5E10)</h1>
+  <div class="badges">
+    <span class="badge" id="tfver">TF.js: …</span>
+    <span class="badge" id="status">Status: initializing…</span>
+  </div>
+
+  <div class="controls card" style="margin-top:12px">
+    <div>
+      <div class="controls-title">Dataset</div>
+      <label>Data source</label>
+      <select id="dataSource">
+        <option value="./data/train.csv" selected>./data/train.csv</option>
+        <option value="./data/test.csv">./data/test.csv</option>
+      </select>
+      <label style="margin-top:8px"><input id="useSubset" type="checkbox" /> Use sampled subset</label>
+      <label>Subset size: <span class="value" id="subsetSizeVal">50000</span></label>
+      <input id="subsetSize" type="range" min="5000" max="200000" step="5000" value="50000" />
+      <div class="muted" style="margin-top:6px">Place CSV files into <span class="pill">/data/</span> of your repo. Browser will fetch them from GitHub Pages.</div>
+    </div>
+
+    <div>
+      <div class="controls-title">Preprocessing</div>
+      <label>Scaler</label>
+      <select id="scaler">
+        <option value="minmax" selected>MinMax (0–1)</option>
+        <option value="standard">Standard (z-score)</option>
+      </select>
+      <label style="margin-top:8px">Evaluation mode</label>
+      <select id="evalMode">
+        <option value="reg" selected>Regression (RMSE/MAE/R²)</option>
+        <option value="bin">Binarized Accuracy</option>
+      </select>
+      <label>Threshold (bin mode): <span id="thrVal" class="value">0.5</span></label>
+      <input id="thr" type="range" min="0" max="1" step="0.01" value="0.5" />
+    </div>
+
+    <div>
+      <div class="controls-title">Model</div>
+      <label>Architecture</label>
+      <select id="arch">
+        <option value="mlp" selected>MLP (tabular)</option>
+        <option value="cnn1d">CNN-1D (over features)</option>
+        <option value="gru" disabled>GRU (sequence) — disabled for flat CSV</option>
+      </select>
+      <label>Epochs: <span id="epochsVal" class="value">10</span></label>
+      <input id="epochs" type="range" min="1" max="30" step="1" value="10" />
+      <label>Batch size: <span id="batchVal" class="value">256</span></label>
+      <input id="batch" type="range" min="32" max="1024" step="32" value="256" />
+      <label>Learning rate: <span id="lrVal" class="value">0.001</span></label>
+      <input id="lr" type="range" min="0.0001" max="0.01" step="0.0001" value="0.001" />
+      <label>Validation split: <span id="valSplitVal" class="value">0.1</span></label>
+      <input id="valSplit" type="range" min="0.05" max="0.3" step="0.01" value="0.1" />
+    </div>
+
+    <div>
+      <div class="controls-title">Pipeline</div>
+      <div class="grid" style="grid-template-columns: repeat(3, max-content); gap:8px">
+        <button id="btnLoad">Load Data</button>
+        <button id="btnBuild">Build Model</button>
+        <button id="btnTrain" class="primary">Train</button>
+      </div>
+      <div class="grid" style="grid-template-columns: repeat(4, max-content); gap:8px; margin-top:8px">
+        <button id="btnEvalFiltered">Evaluate (Filtered)</button>
+        <button id="btnEvalFull">Evaluate (Full Test)</button>
+        <button id="btnSaveIdx">Save → Browser</button>
+        <button id="btnLoadIdx">Load ← Browser</button>
+      </div>
+      <div style="margin-top:8px">
+        <button id="btnExport">Export Weights</button>
+      </div>
+    </div>
+
+    <div id="featureControls" class="card" style="grid-column: 1 / -1">
+      <div class="controls-title">Feature Filters (affect EVALUATION only)</div>
+      <div id="featureGrid" class="grid" style="grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:10px"></div>
+      <div class="muted" style="margin-top:6px">Filters are applied to test set when you click “Evaluate (Filtered)”.</div>
+    </div>
+  </div>
+
+  <div class="two-col" style="margin-top:12px">
+    <div class="card">
+      <div style="font-weight:600; margin-bottom:6px">Visualizations</div>
+      <div class="row">
+        <div class="card" style="flex:1; min-width:260px">
+          <div style="font-weight:600; margin-bottom:6px">Metrics</div>
+          <table>
+            <tbody>
+              <tr><th>RMSE</th><td id="rmse">—</td></tr>
+              <tr><th>MAE</th><td id="mae">—</td></tr>
+              <tr><th>R²</th><td id="r2">—</td></tr>
+              <tr><th>Accuracy @thr</th><td id="acc">—</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card" style="flex:2; min-width:320px">
+          <div style="font-weight:600; margin-bottom:6px">Residuals Histogram</div>
+          <canvas id="hist"></canvas>
+        </div>
+      </div>
+      <div class="card" style="margin-top:10px">
+        <div style="font-weight:600; margin-bottom:6px">y_true vs y_pred (scatter)</div>
+        <canvas id="scatter"></canvas>
+      </div>
+    </div>
+
+    <div class="card" style="min-width: 280px">
+      <div style="font-weight:600; margin-bottom:6px">Logs</div>
+      <div id="log">—</div>
+    </div>
+  </div>
+
+  <!-- Libraries -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  <!-- App modules -->
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
